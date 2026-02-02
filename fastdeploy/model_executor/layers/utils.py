@@ -575,3 +575,16 @@ def modules_to_convert(prefix: str, fd_config: FDConfig):
         return True
     else:
         return True
+
+
+def is_flashinfer_available():
+    """
+    Check whether flashinfer is available.
+    As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
+
+    """
+    import importlib.util
+
+    if not current_platform.is_cuda():
+        return False
+    return importlib.util.find_spec("flashinfer") is not None

@@ -23,6 +23,21 @@ from paddle import nn
 from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.platforms import current_platform
 
+from .utils import get_tensor, is_flashinfer_available, modules_to_convert
+
+# Check flashinfer availability and import at module level for better performance
+_flashinfer_rmsnorm = None
+_flashinfer_fused_add_rmsnorm = None
+
+if is_flashinfer_available():
+    try:
+        from flashinfer.norm import fused_add_rmsnorm as _flashinfer_fused_add_rmsnorm
+        from flashinfer.norm import rmsnorm as _flashinfer_rmsnorm
+    except (ImportError, AttributeError):
+        _flashinfer_rmsnorm = None
+        _flashinfer_fused_add_rmsnorm = None
+
+
 if current_platform.is_gcu():
     from fastdeploy.model_executor.ops.gcu import fused_add_rms_norm, rms_norm
 else:
@@ -30,8 +45,6 @@ else:
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.ops.triton_ops import _TRITON_AVAILABLE, qk_rmsnorm_fused
-
-from .utils import get_tensor, modules_to_convert
 
 
 class RMSNorm(nn.Layer):
@@ -82,6 +95,10 @@ class RMSNorm(nn.Layer):
             self.norm_func: Callable = fused_add_rms_norm
         else:
             self.norm_func: Callable = fused_rms_norm
+        # Use flashinfer when available on CUDA for better performance
+        self._use_flashinfer = (
+            is_flashinfer_available() and _flashinfer_rmsnorm is not None and _flashinfer_fused_add_rmsnorm is not None
+        )
         self.bias: Optional[paddle.Tensor] = bias
         self.quant_scale: Optional[float] = quant_scale
 
@@ -230,12 +247,23 @@ class RMSNorm(nn.Layer):
 
         if residual_input is None:
             residual_out = x
+        norm_out = None
         if proxy_rmsnorm is None:
             if current_platform.is_gcu():
                 if residual_input is None:
                     norm_out = rms_norm(x, self.weight, self.eps)
                     return norm_out.astype(x_dtype), residual_out
                 norm_out = self.norm_func(x, residual_input, self.weight, self.eps)
+            elif self._use_flashinfer:
+                # Use flashinfer kernels for better GPU performance
+                # flashinfer::norm::FusedAddRMSNormKernel provides optimized fused operations
+                if residual_input is not None:
+                    # fused_add_rmsnorm operates in-place: x = rmsnorm(x + residual), residual = x + residual
+                    _flashinfer_fused_add_rmsnorm(x, residual_input, self.weight, self.eps)
+                    norm_out = (x, residual_input)
+                else:
+                    out_t = _flashinfer_rmsnorm(x, self.weight, self.eps)
+                    norm_out = (out_t, x)
             else:
                 norm_out = self.norm_func(
                     x,
@@ -254,6 +282,8 @@ class RMSNorm(nn.Layer):
             if residual_input is not None:
                 x = x + residual_input
             norm_out = proxy_rmsnorm(x, self.weight, self.eps), x
+        if isinstance(norm_out, paddle.Tensor):
+            norm_out = (norm_out, residual_input if residual_input is not None else x)
 
         out = norm_out[0].astype(x_dtype)
         if residual_input is not None:
